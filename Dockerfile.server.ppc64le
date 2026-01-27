@@ -1,0 +1,232 @@
+#####
+# WIP
+###############################################################
+# Stage 1 Base builder image with common tooling
+###############################################################
+
+FROM registry.access.redhat.com/ubi9/python-312:latest as build
+
+USER 0
+WORKDIR /app
+
+ENV TORCH_VERSION=2.9.0
+ENV PATH="$HOME/.cargo/bin:$PATH"
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/app/.venv/lib64/python3.12/site-packages/openblas/lib/
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/
+ENV BLIS_ARCH=generic
+ARG TARGETARCH
+
+# Install dependencies
+RUN dnf install -y skopeo && dnf clean all
+RUN if [ "$TARGETARCH" = "s390x" ]; then \
+        dnf install -y gcc-toolset-13 make wget unzip rust cargo gcc-gfortran python3-devel openblas-devel pkgconfig zlib-devel lz4-devel libzstd-devel bzip2-devel brotli-devel binutils && \
+        dnf clean all                                             ; \
+    elif [ "$TARGETARCH" = "ppc64le" ]; then                        \
+        dnf install -y cmake gcc-toolset-14 ninja-build g++ rust cargo  && \
+        dnf clean all                                             ; \
+    fi                                                           && \
+    pip install --upgrade pip 'cmake<4' setuptools wheel
+
+# Create a dummy file to trigger build dependency
+RUN touch /tmp/control
+
+###############################################################
+# Stage 2 to build pyTorch
+###############################################################
+
+FROM build AS torch-builder
+USER root
+
+ARG MAX_JOBS
+ARG _GLIBCXX_USE_CXX11_ABI=1
+RUN mkdir -p /torchwheels
+
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "s390x" ] || [ "$TARGETARCH" = "ppc64le" ]; then \
+    source /opt/rh/gcc-toolset-14/enable &&  \
+    git clone --recursive https://github.com/pytorch/pytorch.git -b v${TORCH_VERSION} && \
+    cd pytorch && pip install -r requirements.txt && \
+    python setup.py develop                       && \
+    rm -f dist/torch*+git*whl                     && \
+    PYTORCH_BUILD_VERSION=${TORCH_VERSION} PYTORCH_BUILD_NUMBER=1 pip wheel . --wheel-dir /torchwheels/ \
+; fi
+
+###############################################################
+# Stage 3 to build OpenBLAS
+###############################################################
+
+FROM build AS openblas-builder
+ENV OPENBLAS_VERSION=0.3.30
+ARG TARGETARCH
+
+WORKDIR /root
+
+# Creating a directory for OpenBlas
+RUN mkdir /tmp/openblas
+
+RUN if [ "$TARGETARCH" = "ppc64le" ]; then \
+        source /opt/rh/gcc-toolset-14/enable &&  \
+        wget https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}.zip && \
+        unzip OpenBLAS-${OPENBLAS_VERSION}.zip -d /tmp/ && mv -T /tmp/OpenBLAS-${OPENBLAS_VERSION} /tmp/openblas             && \
+        cd /tmp/openblas                                                                                                     && \
+        make -j$(nproc) TARGET=POWER9 BINARY=64 USE_OPENMP=1 USE_THREAD=1 NUM_THREADS=120 DYNAMIC_ARCH=1 INTERFACE64=0        ; \
+    fi
+
+###############################################################
+# Stage 4 to build Thinc
+###############################################################
+
+FROM build as thinc-builder
+
+ENV THINC_VERSION=release-v8.3.6
+RUN git clone https://github.com/explosion/thinc
+
+RUN cd thinc && git checkout ${THINC_VERSION} && \
+       pip install -r requirements.txt        && \
+       python setup.py develop                && \
+       pip wheel . --wheel-dir /thincwheels
+
+###############################################################
+# Stage 5 to build Tiktoken
+###############################################################
+
+FROM build as tiktoken-builder
+
+ENV TIKTOKEN_VERSION=0.9.0
+
+ENV PATH="$HOME/.cargo/bin:$PATH"
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/app/.venv/lib64/python3.12/site-packages/openblas/lib/
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/
+
+# Install dependencies
+#RUN yum install -y git python3.12 python3.12-devel python3.12-pip gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ gcc-toolset-13-gcc-gfortran make wget sudo cmake
+RUN python3 -m pip install --upgrade pip setuptools wheel setuptools-rust
+
+#ENV PATH=$PATH:/usr/local/bin/
+# ENV PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
+# ENV LD_LIBRARY_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64:$LD_LIBRARY_PATH
+
+RUN source /opt/rh/gcc-toolset-14/enable && \
+    git clone https://github.com/openai/tiktoken.git && \
+    cd tiktoken && \
+    git checkout ${TIKTOKEN_VERSION} && \
+    pip wheel . --wheel-dir /tiktokenwheels
+
+###############################################################
+# Stage 6 Install all the dependencies
+###############################################################
+
+FROM registry.access.redhat.com/ubi9/python-312:latest as builder
+
+USER 0
+WORKDIR /app
+
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/app/.venv/lib64/python3.12/site-packages/openblas/lib/
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/
+ENV PATH="$HOME/.cargo/bin:$PATH"
+ENV BLIS_ARCH=generic
+ARG TARGETARCH
+
+RUN python3 -m venv /app/.venv
+
+# copy built OpenBLAS sources
+COPY --from=openblas-builder /tmp/openblas/ /app/openblas
+
+# Install OpenBLAS
+RUN if [ "$TARGETARCH" = "ppc64le" ]; then \
+        PREFIX=/usr/local  make -C /app/openblas install && rm -rf /app/openblas     ; \
+   fi
+
+RUN --mount=type=cache,from=torch-builder,source=/torchwheels/,target=/app/torchwheels/,ro \
+   if [ "$TARGETARCH" = "s390x" ] || [ "$TARGETARCH" = "ppc64le" ]; then     \
+       /app/.venv/bin/pip install  /app/torchwheels/*.whl        ; \
+   fi
+
+RUN --mount=type=cache,from=thinc-builder,source=/thincwheels/,target=/app/thincwheels/,ro \
+   if [ "$TARGETARCH" = "s390x" ] || [ "$TARGETARCH" = "ppc64le" ]; then     \
+       /app/.venv/bin/pip install /app/thincwheels/*.whl        ; \
+   fi
+
+RUN --mount=type=cache,from=tiktoken-builder,source=/tiktokenwheels/,target=/app/tiktokenwheels/,ro \
+   if [ "$TARGETARCH" = "s390x" ] || [ "$TARGETARCH" = "ppc64le" ]; then     \
+       /app/.venv/bin/pip install /app/tiktokenwheels/*.whl        ; \
+   fi
+
+RUN /app/.venv/bin/pip install spacy==3.8.7 presidio-analyzer==2.2.359 \
+        langchain-openai==0.3.28 scipy==1.16.3 sentence-transformers==5.1.2 scikit-learn==1.7.2
+
+RUN /app/.venv/bin/pip install onnxruntime==1.22.0 --extra-index-url https://wheels.developerfirst.ibm.com/ppc64le/linux
+
+#COPY wheels /app/wheels
+#RUN /app/.venv/bin/pip install /app/wheels/*
+
+ARG PYYAML_VERSION=6.0.3
+ARG GUARDRAILS_PROFILE=opensource
+
+RUN dnf install -y --nodocs --setopt=install_weak_deps=False \
+        gcc \
+        gcc-c++ \
+        git && \
+    pip install --no-cache-dir \
+        pyyaml==${PYYAML_VERSION} && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+
+COPY requirements.txt pyproject.toml README.md ./
+COPY nemoguardrails/ ./nemoguardrails/
+COPY scripts/ ./scripts/
+COPY examples/bots/ ./examples/bots/
+
+RUN chmod +x ./scripts/entrypoint.sh
+RUN python3 ./scripts/filter_guardrails.py ./scripts/provider-list.yaml $GUARDRAILS_PROFILE
+
+ENV HF_HOME=/app/.cache/huggingface \
+    TRANSFORMERS_CACHE=/app/.cache/transformers \
+    SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers \
+    NLTK_DATA=/app/.cache/nltk_data \
+    FASTEMBED_CACHE_PATH=/app/.cache/fastembed
+
+# Create virtual environment and install dependencies
+RUN /app/.venv/bin/pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt && \
+    /app/.venv/bin/pip install --no-cache-dir --no-deps . && \
+    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
+
+# Pre-download required models and cleanup
+RUN set -ex && \
+    GUARDRAILS_PROFILE=$GUARDRAILS_PROFILE /app/.venv/bin/python ./scripts/pre_download_required_models.py && \
+    find /app/.cache -type f -name "*.pyc" -delete && \
+    find /app/.cache -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
+    find /app/.cache -type d -name ".git" -exec rm -rf {} + 2>/dev/null || true && \
+    rm -rf /app/.cache/huggingface/xet /root/.cache /tmp/* /var/tmp/* && \
+    dnf remove -y gcc gcc-c++ git && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+FROM registry.access.redhat.com/ubi9/python-312:latest as runtime
+
+USER 0
+WORKDIR /app
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+
+COPY --from=builder /app /app
+
+RUN rm -f /etc/security/namespace.conf /usr/lib64/security/pam_namespace.so || true && \
+    chgrp -R 0 /app && \
+    chmod -R g=u /app && \
+    chmod +x /app/scripts/entrypoint.sh
+
+USER 1001
+
+ENV HF_HOME=/app/.cache/huggingface \
+    TRANSFORMERS_CACHE=/app/.cache/transformers \
+    SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers \
+    NLTK_DATA=/app/.cache/nltk_data \
+    FASTEMBED_CACHE_PATH=/app/.cache/fastembed \
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8000
+ENTRYPOINT ["./scripts/entrypoint.sh"]
